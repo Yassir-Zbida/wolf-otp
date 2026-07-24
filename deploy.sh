@@ -1,18 +1,19 @@
 #!/usr/bin/env bash
 # Wolf OTP — one-shot VPS deploy (safe alongside an existing app)
+# VERSION: 2026-07-24c
 #
-# Usage (as root on the VPS):
-#   curl -fsSL https://raw.githubusercontent.com/Yassir-Zbida/wolf-otp/main/deploy.sh | bash
+# Preferred (uses latest from this repo after clone/pull):
+#   bash /opt/wolf-otp/deploy.sh
 #
-# Optional env overrides:
-#   DOMAIN=otp.wolfstor.com
-#   EMAIL=admin@wolfstor.com
-#   APP_DIR=/opt/wolf-otp
-#   APP_HOST_PORT=4000
-#   WAHA_HOST_PORT=3000
+# Or:
+#   curl -fsSL "https://raw.githubusercontent.com/Yassir-Zbida/wolf-otp/main/deploy.sh?$(date +%s)" | bash
+#
+# Optional env:
+#   DOMAIN=otp.wolfstor.com EMAIL=admin@wolfstor.com APP_DIR=/opt/wolf-otp
 
 set -euo pipefail
 
+DEPLOY_VERSION="2026-07-24c"
 REPO_URL="${REPO_URL:-https://github.com/Yassir-Zbida/wolf-otp.git}"
 DOMAIN="${DOMAIN:-otp.wolfstor.com}"
 EMAIL="${EMAIL:-admin@${DOMAIN#*.}}"
@@ -20,7 +21,7 @@ APP_DIR="${APP_DIR:-/opt/wolf-otp}"
 APP_HOST_PORT="${APP_HOST_PORT:-4000}"
 WAHA_HOST_PORT="${WAHA_HOST_PORT:-3000}"
 APP_BIND="127.0.0.1"
-PROXY_MODE="auto" # auto|nginx|caddy|traefik|manual
+PROXY_MODE="${PROXY_MODE:-auto}" # auto|nginx|caddy|traefik|manual
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,15 +33,14 @@ warn() { echo -e "${YELLOW}[wolf-otp]${NC} $*"; }
 die()  { echo -e "${RED}[wolf-otp]${NC} $*" >&2; exit 1; }
 
 require_root() {
-  if [[ "${EUID}" -ne 0 ]]; then
-    die "Run as root (or: sudo bash deploy.sh)"
-  fi
+  [[ "${EUID}" -eq 0 ]] || die "Run as root"
 }
 
+# Reliable listen check (avoid fragile ss filter DSL)
 port_in_use() {
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
-    ss -ltn "( sport = :${port} )" 2>/dev/null | tail -n +2 | grep -q .
+    ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:|\\.)${port}$"
   elif command -v lsof >/dev/null 2>&1; then
     lsof -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
   else
@@ -49,31 +49,25 @@ port_in_use() {
 }
 
 pick_free_port() {
-  local start="$1"
-  local p="$start"
-  local i=0
+  local start="$1" p="$1" i=0
   while port_in_use "$p"; do
-    # Skip if our own wolf-otp containers already own it
-    if docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -qE "wolf-otp.*(:${p}->|0\.0\.0\.0:${p}|127\.0\.0\.1:${p})"; then
-      echo "$p"
-      return
+    if docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -qE "wolf-otp-(app|waha).*[:.]${p}->"; then
+      echo "$p"; return
     fi
-    p=$((p + 1))
-    i=$((i + 1))
-    if (( i > 50 )); then
-      die "Could not find a free port near ${start}"
+    # Also allow if only our previous publish is bound (compose project name)
+    if docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null | grep -qE "wolf-otp.*[:.]${p}->"; then
+      echo "$p"; return
     fi
+    p=$((p + 1)); i=$((i + 1))
+    (( i > 50 )) && die "No free port near ${start}"
   done
   echo "$p"
 }
 
 who_owns_port() {
   local port="$1"
-  if command -v ss >/dev/null 2>&1; then
-    ss -ltnp "( sport = :${port} )" 2>/dev/null | tail -n +2 || true
-  else
-    lsof -iTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true
-  fi
+  ss -ltnp 2>/dev/null | awk -v p=":${port}" '$4 ~ p"$" {print}' || true
+  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null | grep -E "NAMES|:${port}->" || true
 }
 
 detect_proxy() {
@@ -82,85 +76,72 @@ detect_proxy() {
     return
   fi
 
-  # Docker Traefik?
-  if docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -qiE 'traefik'; then
-    PROXY_MODE="traefik"
-    log "Detected Traefik (Docker) on this host."
-    return
+  if docker ps --format '{{.Image}}' 2>/dev/null | grep -qi traefik; then
+    PROXY_MODE="traefik"; log "Detected Traefik."; return
+  fi
+  if docker ps --format '{{.Image}}' 2>/dev/null | grep -qi caddy; then
+    PROXY_MODE="caddy-docker"; log "Detected Caddy (Docker)."; return
+  fi
+  if systemctl is-active --quiet caddy 2>/dev/null; then
+    PROXY_MODE="caddy"; log "Detected Caddy (systemd)."; return
   fi
 
-  # Docker or systemd Caddy?
-  if docker ps --format '{{.Names}} {{.Image}}' 2>/dev/null | grep -qiE 'caddy'; then
-    PROXY_MODE="caddy-docker"
-    log "Detected Caddy (Docker) on this host."
-    return
-  fi
-  if systemctl is-active --quiet caddy 2>/dev/null || command -v caddy >/dev/null 2>&1; then
-    PROXY_MODE="caddy"
-    log "Detected Caddy (systemd/binary) on this host."
-    return
-  fi
-
-  # Working nginx already listening on 80?
-  if systemctl is-active --quiet nginx 2>/dev/null && port_in_use 80; then
-    if who_owns_port 80 | grep -qi nginx; then
-      PROXY_MODE="nginx"
-      log "Detected active nginx on port 80."
-      return
+  if port_in_use 80; then
+    if who_owns_port 80 | grep -qi nginx && systemctl is-active --quiet nginx 2>/dev/null; then
+      PROXY_MODE="nginx"; log "Detected active nginx on :80."; return
     fi
-  fi
-
-  # Port 80 free → we can own it with nginx
-  if ! port_in_use 80; then
-    PROXY_MODE="nginx"
-    log "Port 80 is free — will use nginx + certbot."
+    PROXY_MODE="manual"
+    warn "Port 80 is in use — will NOT start a second nginx."
+    who_owns_port 80 | sed 's/^/  /' || true
     return
   fi
 
-  # Port 80 taken by something else
-  PROXY_MODE="manual"
-  warn "Port 80 is already in use by another process:"
-  who_owns_port 80 | sed 's/^/  /' || true
-  if docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' 2>/dev/null | grep -E ':80->|:443->' ; then
-    warn "Docker containers publishing 80/443:"
-    docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' | grep -E 'NAMES|:80->|:443->' || true
-  fi
+  PROXY_MODE="nginx"
+  log "Port 80 free — will use nginx + certbot."
 }
 
-install_packages() {
+install_base() {
   export DEBIAN_FRONTEND=noninteractive
-  log "Installing base packages..."
-  apt-get update -y
-  apt-get install -y ca-certificates curl gnupg git openssl
+  log "Installing base packages (git/curl/openssl)..."
+  apt-get update -y >/dev/null
+  apt-get install -y ca-certificates curl gnupg git openssl >/dev/null
 
   if ! command -v docker >/dev/null 2>&1; then
     log "Installing Docker..."
     install -m 0755 -d /etc/apt/keyrings
-    if [[ ! -f /etc/apt/keyrings/docker.asc ]]; then
+    [[ -f /etc/apt/keyrings/docker.asc ]] || {
       curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
       chmod a+r /etc/apt/keyrings/docker.asc
-    fi
+    }
     . /etc/os-release
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" \
       > /etc/apt/sources.list.d/docker.list
-    apt-get update -y
+    apt-get update -y >/dev/null
     apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
     systemctl enable --now docker
   else
     log "Docker already installed."
   fi
+  docker compose version >/dev/null || die "docker compose plugin missing"
 
-  if ! docker compose version >/dev/null 2>&1; then
-    die "docker compose plugin missing. Install docker-compose-plugin and re-run."
-  fi
-
+  # Only install/start nginx when we own port 80
   if [[ "${PROXY_MODE}" == "nginx" ]]; then
-    apt-get install -y nginx
-    if ! command -v certbot >/dev/null 2>&1; then
-      apt-get install -y certbot python3-certbot-nginx
-    fi
+    apt-get install -y nginx certbot python3-certbot-nginx >/dev/null
     systemctl enable nginx >/dev/null 2>&1 || true
-    systemctl start nginx || die "Failed to start nginx (is port 80 free?)."
+    systemctl start nginx || {
+      warn "nginx failed to start — falling back to manual proxy mode."
+      PROXY_MODE="manual"
+      systemctl disable nginx >/dev/null 2>&1 || true
+      systemctl stop nginx >/dev/null 2>&1 || true
+    }
+  else
+    # Stop packaged nginx if it was installed earlier and is fighting the real proxy
+    if systemctl list-unit-files nginx.service >/dev/null 2>&1; then
+      if ! systemctl is-active --quiet nginx 2>/dev/null; then
+        systemctl disable nginx >/dev/null 2>&1 || true
+        systemctl stop nginx >/dev/null 2>&1 || true
+      fi
+    fi
   fi
 }
 
@@ -170,24 +151,36 @@ clone_or_update() {
     git -C "${APP_DIR}" fetch --depth 1 origin main
     git -C "${APP_DIR}" reset --hard origin/main
   else
-    log "Cloning repo into ${APP_DIR}..."
+    log "Cloning into ${APP_DIR}..."
     mkdir -p "$(dirname "${APP_DIR}")"
     git clone --depth 1 "${REPO_URL}" "${APP_DIR}"
+  fi
+  # Re-exec latest script from disk once (avoids curl CDN cache)
+  if [[ "${WOLF_OTP_REEXEC:-}" != "1" && -f "${APP_DIR}/deploy.sh" ]]; then
+    local disk_ver
+    disk_ver="$(grep -E '^DEPLOY_VERSION=' "${APP_DIR}/deploy.sh" | head -1 | cut -d= -f2- | tr -d '"' || true)"
+    if [[ -n "${disk_ver}" && "${disk_ver}" != "${DEPLOY_VERSION}" ]]; then
+      log "Newer deploy.sh on disk (${disk_ver}) — re-executing..."
+      exec env WOLF_OTP_REEXEC=1 DOMAIN="${DOMAIN}" EMAIL="${EMAIL}" APP_DIR="${APP_DIR}" \
+        APP_HOST_PORT="${APP_HOST_PORT}" WAHA_HOST_PORT="${WAHA_HOST_PORT}" PROXY_MODE="${PROXY_MODE}" \
+        bash "${APP_DIR}/deploy.sh"
+    fi
   fi
 }
 
 write_env() {
   local env_file="${APP_DIR}/.env"
+  touch_kv() {
+    local key="$1" val="$2"
+    if grep -q "^${key}=" "${env_file}" 2>/dev/null; then
+      sed -i "s|^${key}=.*|${key}=${val}|" "${env_file}"
+    else
+      echo "${key}=${val}" >> "${env_file}"
+    fi
+  }
+
   if [[ -f "${env_file}" ]]; then
-    log ".env already exists — keeping secrets, refreshing ports/bind."
-    touch_kv() {
-      local key="$1" val="$2"
-      if grep -q "^${key}=" "${env_file}"; then
-        sed -i "s|^${key}=.*|${key}=${val}|" "${env_file}"
-      else
-        echo "${key}=${val}" >> "${env_file}"
-      fi
-    }
+    log ".env exists — keeping secrets, refreshing bind/ports."
     touch_kv APP_BIND "${APP_BIND}"
     touch_kv TRUST_PROXY 1
     touch_kv APP_HOST_PORT "${APP_HOST_PORT}"
@@ -208,20 +201,16 @@ APP_BIND=${APP_BIND}
 APP_HOST_PORT=${APP_HOST_PORT}
 WAHA_HOST_PORT=${WAHA_HOST_PORT}
 TRUST_PROXY=1
-
 REDIS_URL=redis://redis:6379
 WAHA_BASE_URL=http://waha:3000
 WAHA_SESSION=default
-
 WAHA_API_KEY=${waha_key}
 WAHA_DASHBOARD_USERNAME=admin
 WAHA_DASHBOARD_PASSWORD=${dash_pass}
 WHATSAPP_SWAGGER_USERNAME=admin
 WHATSAPP_SWAGGER_PASSWORD=${dash_pass}
-
 API_KEY=${api_key}
 OTP_SECRET=${otp_secret}
-
 OTP_EXPIRY_SECONDS=300
 OTP_MAX_ATTEMPTS=5
 OTP_RESEND_COOLDOWN_SECONDS=60
@@ -256,12 +245,10 @@ EOF
 write_proxy_snippets() {
   mkdir -p "${APP_DIR}/proxy"
   cat > "${APP_DIR}/proxy/nginx.conf" <<EOF
-# Add as a server block (or sites-available) on your existing nginx
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
-
     location / {
         proxy_pass http://127.0.0.1:${APP_HOST_PORT};
         proxy_http_version 1.1;
@@ -269,42 +256,26 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 60s;
         client_max_body_size 64k;
     }
 }
 EOF
-
   cat > "${APP_DIR}/proxy/Caddyfile.snippet" <<EOF
 ${DOMAIN} {
 	reverse_proxy 127.0.0.1:${APP_HOST_PORT}
 }
 EOF
-
-  cat > "${APP_DIR}/proxy/README.txt" <<EOF
-Wolf OTP reverse-proxy helpers for ${DOMAIN} → 127.0.0.1:${APP_HOST_PORT}
-
-Detected mode during deploy: ${PROXY_MODE}
-
-If auto-config did not apply, add the matching snippet to your existing reverse proxy,
-then reload it. Snippets are in this folder.
-EOF
 }
 
 configure_nginx() {
   local conf="/etc/nginx/sites-available/wolf-otp.conf"
-  log "Writing nginx site for ${DOMAIN} → 127.0.0.1:${APP_HOST_PORT}"
-
+  log "Writing nginx site ${DOMAIN} → 127.0.0.1:${APP_HOST_PORT}"
   cat > "${conf}" <<EOF
 server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
-
-    location /.well-known/acme-challenge/ {
-        root /var/www/html;
-    }
-
+    location /.well-known/acme-challenge/ { root /var/www/html; }
     location / {
         proxy_pass http://127.0.0.1:${APP_HOST_PORT};
         proxy_http_version 1.1;
@@ -312,71 +283,37 @@ server {
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_read_timeout 60s;
         client_max_body_size 64k;
     }
 }
 EOF
-
   ln -sfn "${conf}" /etc/nginx/sites-enabled/wolf-otp.conf
-  # Avoid clashing with default site only if it steals our server_name — leave other sites alone
   nginx -t
   systemctl reload nginx || systemctl start nginx
-}
-
-issue_ssl_nginx() {
-  if [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
-    log "TLS cert already exists for ${DOMAIN}."
-    return
+  if [[ ! -d "/etc/letsencrypt/live/${DOMAIN}" ]]; then
+    log "Requesting Let's Encrypt cert..."
+    certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect \
+      || warn "Certbot failed — check DNS, then: certbot --nginx -d ${DOMAIN}"
   fi
-  log "Requesting Let's Encrypt certificate for ${DOMAIN}..."
-  wait_for_dns
-  certbot --nginx -d "${DOMAIN}" --non-interactive --agree-tos -m "${EMAIL}" --redirect \
-    || warn "Certbot failed. HTTP may still work; fix DNS and re-run certbot --nginx -d ${DOMAIN}"
 }
 
-configure_caddy_systemd() {
-  local snippet="${APP_DIR}/proxy/Caddyfile.snippet"
+configure_caddy() {
   local conf="/etc/caddy/Caddyfile"
-  log "Adding ${DOMAIN} to Caddyfile..."
-  mkdir -p /etc/caddy
-  touch "${conf}"
-  if grep -qF "${DOMAIN}" "${conf}" 2>/dev/null; then
-    log "Caddy already has an entry for ${DOMAIN}."
-  else
-    {
-      echo
-      echo "# wolf-otp"
-      cat "${snippet}"
-    } >> "${conf}"
+  mkdir -p /etc/caddy; touch "${conf}"
+  if ! grep -qF "${DOMAIN}" "${conf}"; then
+    { echo; echo "# wolf-otp"; cat "${APP_DIR}/proxy/Caddyfile.snippet"; } >> "${conf}"
   fi
-  if systemctl is-active --quiet caddy 2>/dev/null; then
-    caddy validate --config "${conf}" || warn "Caddyfile validate failed — check /etc/caddy/Caddyfile"
-    systemctl reload caddy || systemctl restart caddy
-  else
-    warn "Caddy binary present but service not active. Snippet saved at ${snippet}"
-  fi
-}
-
-configure_caddy_docker() {
-  log "Caddy runs in Docker — writing snippet for you to include."
-  warn "Add contents of ${APP_DIR}/proxy/Caddyfile.snippet to your Caddy container config, then reload Caddy."
-  docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Ports}}' | grep -i caddy || true
+  caddy validate --config "${conf}" 2>/dev/null || true
+  systemctl reload caddy || systemctl restart caddy || warn "Reload Caddy manually."
 }
 
 configure_traefik() {
-  log "Configuring Traefik labels via docker-compose.override.yml"
-  local network
-  network="$(docker inspect "$(docker ps --format '{{.Names}} {{.Image}}' | grep -i traefik | awk '{print $1}' | head -1)" \
-    --format '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{"\n"}}{{end}}' 2>/dev/null | head -1 || true)"
-
-  if [[ -z "${network}" ]]; then
-    warn "Could not detect Traefik docker network. Snippets saved under ${APP_DIR}/proxy/"
-    PROXY_MODE="manual"
-    return
-  fi
-
-  log "Joining Traefik network: ${network}"
+  local tname network
+  tname="$(docker ps --format '{{.Names}} {{.Image}}' | grep -i traefik | awk '{print $1}' | head -1 || true)"
+  [[ -n "${tname}" ]] || { PROXY_MODE="manual"; return; }
+  network="$(docker inspect "${tname}" --format '{{range $k,$v := .NetworkSettings.Networks}}{{println $k}}{{end}}' | head -1)"
+  [[ -n "${network}" ]] || { PROXY_MODE="manual"; return; }
+  log "Traefik network: ${network}"
   cat > "${APP_DIR}/docker-compose.override.yml" <<EOF
 services:
   app:
@@ -387,40 +324,20 @@ services:
       - traefik.http.routers.wolfotp.entrypoints=websecure
       - traefik.http.routers.wolfotp.tls=true
       - traefik.http.routers.wolfotp.tls.certresolver=letsencrypt
-      - traefik.http.routers.wolfotp-http.rule=Host(\`${DOMAIN}\`)
-      - traefik.http.routers.wolfotp-http.entrypoints=web
-      - traefik.http.routers.wolfotp-http.middlewares=wolfotp-https-redirect
-      - traefik.http.middlewares.wolfotp-https-redirect.redirectscheme.scheme=https
       - traefik.http.services.wolfotp.loadbalancer.server.port=4000
     networks:
       - internal
       - traefik_public
-
 networks:
   traefik_public:
     external: true
     name: ${network}
 EOF
-  warn "If TLS fails, edit certresolver name in docker-compose.override.yml to match your Traefik config."
-}
-
-wait_for_dns() {
-  local ok=0
-  for i in 1 2 3 4 5 6; do
-    if getent hosts "${DOMAIN}" >/dev/null 2>&1; then
-      ok=1
-      break
-    fi
-    warn "DNS for ${DOMAIN} not resolving yet (try ${i}/6)..."
-    sleep 5
-  done
-  if [[ "$ok" -ne 1 ]]; then
-    warn "DNS still not resolving — HTTPS may fail until it does."
-  fi
+  warn "If TLS fails, rename certresolver in override to match your Traefik config."
 }
 
 start_stack() {
-  log "Starting Docker stack..."
+  log "Starting Docker stack (this always runs)..."
   cd "${APP_DIR}"
   docker compose pull || true
   docker compose up --build -d
@@ -429,56 +346,33 @@ start_stack() {
 }
 
 health_check() {
-  log "Checking local health endpoint..."
   local code
   code="$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:${APP_HOST_PORT}/health" || true)"
   if [[ "${code}" == "200" ]]; then
-    log "App health OK (HTTP 200)."
+    log "Local health OK."
   else
-    warn "Health check returned '${code}'. Logs: cd ${APP_DIR} && docker compose logs --tail=80"
-  fi
-
-  code="$(curl -sk -o /dev/null -w '%{http_code}' "https://${DOMAIN}/health" || true)"
-  if [[ "${code}" == "200" ]]; then
-    log "Public https://${DOMAIN}/health OK."
-  else
-    local code80
-    code80="$(curl -s -o /dev/null -w '%{http_code}' -H "Host: ${DOMAIN}" "http://127.0.0.1/health" || true)"
-    warn "Public HTTPS health='${code}'. Local Host-header via :80 health='${code80}'."
-  fi
-}
-
-disable_conflicting_pkg_nginx() {
-  # If we installed nginx earlier but can't use it, keep it disabled so it doesn't fight the real proxy
-  if systemctl is-enabled --quiet nginx 2>/dev/null && ! systemctl is-active --quiet nginx 2>/dev/null; then
-    if [[ "${PROXY_MODE}" != "nginx" ]]; then
-      log "Disabling unused packaged nginx (port 80 owned by another proxy)."
-      systemctl disable nginx >/dev/null 2>&1 || true
-      systemctl stop nginx >/dev/null 2>&1 || true
-    fi
+    warn "Local health=${code}. Try: cd ${APP_DIR} && docker compose logs --tail=100"
   fi
 }
 
 print_summary() {
   echo
   echo "=============================================="
-  echo "  Wolf OTP deploy status"
+  echo "  Wolf OTP  (deploy ${DEPLOY_VERSION})"
   echo "=============================================="
   echo "  Domain:   https://${DOMAIN}"
   echo "  App dir:  ${APP_DIR}"
   echo "  Proxy:    ${PROXY_MODE}"
-  echo "  App port: 127.0.0.1:${APP_HOST_PORT}"
+  echo "  App:      127.0.0.1:${APP_HOST_PORT}"
   if [[ -f "${APP_DIR}/CREDENTIALS.txt" ]]; then
     echo "  Secrets:  ${APP_DIR}/CREDENTIALS.txt"
-    echo
     grep -E '^(Public URL|API_KEY|  user:|  pass:|  Worker|  Base URL|  API key)' "${APP_DIR}/CREDENTIALS.txt" || true
   elif [[ -f "${APP_DIR}/.env" ]]; then
     echo "  API_KEY:  $(grep '^API_KEY=' "${APP_DIR}/.env" | cut -d= -f2-)"
   fi
   if [[ "${PROXY_MODE}" == "manual" || "${PROXY_MODE}" == "caddy-docker" ]]; then
     echo
-    echo "  ACTION REQUIRED: point your existing reverse proxy to"
-    echo "  127.0.0.1:${APP_HOST_PORT} for host ${DOMAIN}"
+    echo "  ACTION: point ${DOMAIN} → 127.0.0.1:${APP_HOST_PORT} in your existing reverse proxy"
     echo "  Snippets: ${APP_DIR}/proxy/"
   fi
   echo "=============================================="
@@ -487,59 +381,34 @@ print_summary() {
 configure_proxy() {
   write_proxy_snippets
   case "${PROXY_MODE}" in
-    nginx)
-      configure_nginx
-      issue_ssl_nginx
-      ;;
-    caddy)
-      configure_caddy_systemd
-      ;;
-    caddy-docker)
-      configure_caddy_docker
-      ;;
-    traefik)
-      configure_traefik
-      ;;
-    manual)
-      warn "Stack will run locally. Wire ${DOMAIN} → 127.0.0.1:${APP_HOST_PORT} in your existing proxy."
-      warn "Ready-made configs: ${APP_DIR}/proxy/"
-      ;;
-    *)
-      die "Unknown PROXY_MODE=${PROXY_MODE}"
-      ;;
+    nginx) configure_nginx || warn "nginx config failed — stack still runs locally." ;;
+    caddy) configure_caddy || true ;;
+    caddy-docker) warn "Add ${APP_DIR}/proxy/Caddyfile.snippet to your Caddy container." ;;
+    traefik) configure_traefik || true ;;
+    manual) warn "Wire proxy manually using ${APP_DIR}/proxy/" ;;
   esac
 }
 
 main() {
   require_root
-  log "Domain=${DOMAIN}  AppDir=${APP_DIR}"
+  log "version=${DEPLOY_VERSION} domain=${DOMAIN} dir=${APP_DIR}"
 
   detect_proxy
-  disable_conflicting_pkg_nginx
-  install_packages
+  install_base
 
-  # Avoid clashing with whatever else is on this VPS (localhost app ports)
   local old
-  old="${APP_HOST_PORT}"
-  APP_HOST_PORT="$(pick_free_port "${APP_HOST_PORT}")"
-  if [[ "${APP_HOST_PORT}" != "${old}" ]]; then
-    warn "Port ${old} busy — using APP_HOST_PORT=${APP_HOST_PORT}"
-  fi
-  old="${WAHA_HOST_PORT}"
-  WAHA_HOST_PORT="$(pick_free_port "${WAHA_HOST_PORT}")"
-  if [[ "${WAHA_HOST_PORT}" != "${old}" ]]; then
-    warn "Port ${old} busy — using WAHA_HOST_PORT=${WAHA_HOST_PORT}"
-  fi
+  old="${APP_HOST_PORT}"; APP_HOST_PORT="$(pick_free_port "${APP_HOST_PORT}")"
+  [[ "${APP_HOST_PORT}" == "${old}" ]] || warn "APP_HOST_PORT ${old}→${APP_HOST_PORT}"
+  old="${WAHA_HOST_PORT}"; WAHA_HOST_PORT="$(pick_free_port "${WAHA_HOST_PORT}")"
+  [[ "${WAHA_HOST_PORT}" == "${old}" ]] || warn "WAHA_HOST_PORT ${old}→${WAHA_HOST_PORT}"
 
   clone_or_update
   write_env
   configure_proxy
   start_stack
 
-  # Traefik override needs a recreate after override file is written
   if [[ "${PROXY_MODE}" == "traefik" && -f "${APP_DIR}/docker-compose.override.yml" ]]; then
-    log "Recreating app with Traefik labels..."
-    (cd "${APP_DIR}" && docker compose up -d --force-recreate app)
+    (cd "${APP_DIR}" && docker compose up -d --force-recreate app) || true
   fi
 
   health_check
