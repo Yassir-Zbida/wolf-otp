@@ -1,0 +1,10 @@
+node_modules
+npm-debug.log
+.env
+.git
+.gitignore
+*.md
+events.json
+wolf-auth
+whatsapp-otp-agent-prompt.md
+.DS_Store

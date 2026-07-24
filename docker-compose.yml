@@ -1,0 +1,60 @@
+services:
+  waha:
+    image: devlikeapro/waha
+    # Official image is amd64-only; required on Apple Silicon (M1/M2/M3/M4)
+    platform: linux/amd64
+    # Dashboard only on localhost — use SSH tunnel in production to scan QR
+    ports:
+      - "127.0.0.1:3000:3000"
+    environment:
+      # Do not load app .env here — PORT=4000 would make WAHA listen on 4000
+      PORT: "3000"
+      WAHA_API_KEY: ${WAHA_API_KEY}
+      WAHA_DASHBOARD_USERNAME: ${WAHA_DASHBOARD_USERNAME:-admin}
+      WAHA_DASHBOARD_PASSWORD: ${WAHA_DASHBOARD_PASSWORD}
+      WHATSAPP_SWAGGER_USERNAME: ${WHATSAPP_SWAGGER_USERNAME:-admin}
+      WHATSAPP_SWAGGER_PASSWORD: ${WHATSAPP_SWAGGER_PASSWORD}
+    volumes:
+      - waha_sessions:/app/.sessions
+    restart: unless-stopped
+    networks:
+      - internal
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1"]
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    networks:
+      - internal
+    # No public ports — Redis is internal only
+
+  app:
+    build: .
+    ports:
+      - "${APP_BIND:-0.0.0.0}:4000:4000"
+    env_file:
+      - .env
+    environment:
+      REDIS_URL: redis://redis:6379
+      WAHA_BASE_URL: http://waha:3000
+      WAHA_API_KEY: ${WAHA_API_KEY}
+      TRUST_PROXY: ${TRUST_PROXY:-1}
+    depends_on:
+      - waha
+      - redis
+    restart: unless-stopped
+    networks:
+      - internal
+    read_only: true
+    tmpfs:
+      - /tmp
+
+volumes:
+  waha_sessions:
+  redis_data:
+
+networks:
+  internal:
+    driver: bridge
