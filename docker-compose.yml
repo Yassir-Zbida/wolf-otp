@@ -5,7 +5,7 @@ services:
     platform: linux/amd64
     # Dashboard only on localhost — use SSH tunnel in production to scan QR
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:${WAHA_HOST_PORT:-3000}:3000"
     environment:
       # Do not load app .env here — PORT=4000 would make WAHA listen on 4000
       PORT: "3000"
@@ -33,7 +33,7 @@ services:
   app:
     build: .
     ports:
-      - "${APP_BIND:-0.0.0.0}:4000:4000"
+      - "${APP_BIND:-127.0.0.1}:${APP_HOST_PORT:-4000}:4000"
     env_file:
       - .env
     environment:

@@ -15,7 +15,25 @@ WordPress (Wolf Auth)  --API_KEY-->  OTP API (:4000)  -->  Redis (hashed OTP)
 - Only HMAC hashes live in Redis (TTL).
 - All `/api/otp/*` routes require `Authorization: Bearer <API_KEY>`.
 
-## Quick start
+## One-command VPS deploy
+
+On your Ubuntu VPS (as root), after DNS `otp.yourdomain.com` → VPS IP:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Yassir-Zbida/wolf-otp/main/deploy.sh | bash
+```
+
+Defaults to `DOMAIN=otp.wolfstor.com`. Override if needed:
+
+```bash
+DOMAIN=otp.example.com EMAIL=you@example.com bash <(curl -fsSL https://raw.githubusercontent.com/Yassir-Zbida/wolf-otp/main/deploy.sh)
+```
+
+The script installs Docker/nginx/certbot if missing, clones into `/opt/wolf-otp`, generates secrets, proxies only this subdomain (won't replace other nginx sites), issues HTTPS, and starts the stack on localhost ports so it won't fight an existing app.
+
+Credentials are saved to `/opt/wolf-otp/CREDENTIALS.txt`.
+
+## Manual / local start
 
 ```bash
 cp .env.example .env
@@ -26,7 +44,7 @@ docker compose up --build -d
 
 | Service | Exposure | Role |
 |---------|----------|------|
-| `app`   | `0.0.0.0:4000` (or `APP_BIND`) | Public OTP API (protect with HTTPS + firewall) |
+| `app`   | `127.0.0.1:4000` (default) | OTP API behind nginx |
 | `waha`  | `127.0.0.1:3000` only | Dashboard / QR — not public |
 | `redis` | internal network only | OTP hashes / cooldowns |
 
