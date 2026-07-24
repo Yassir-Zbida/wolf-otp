@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Wolf OTP — one-shot VPS deploy (safe alongside an existing app)
-# VERSION: 2026-07-24c
+# VERSION: 2026-07-24d
 #
 # Preferred (uses latest from this repo after clone/pull):
 #   bash /opt/wolf-otp/deploy.sh
@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-DEPLOY_VERSION="2026-07-24c"
+DEPLOY_VERSION="2026-07-24d"
 REPO_URL="${REPO_URL:-https://github.com/Yassir-Zbida/wolf-otp.git}"
 DOMAIN="${DOMAIN:-otp.wolfstor.com}"
 EMAIL="${EMAIL:-admin@${DOMAIN#*.}}"
@@ -383,7 +383,7 @@ configure_proxy() {
   case "${PROXY_MODE}" in
     nginx) configure_nginx || warn "nginx config failed — stack still runs locally." ;;
     caddy) configure_caddy || true ;;
-    caddy-docker) warn "Add ${APP_DIR}/proxy/Caddyfile.snippet to your Caddy container." ;;
+    caddy-docker) log "Caddy (Docker) will be wired after the stack starts." ;;
     traefik) configure_traefik || true ;;
     manual) warn "Wire proxy manually using ${APP_DIR}/proxy/" ;;
   esac
@@ -409,6 +409,15 @@ main() {
 
   if [[ "${PROXY_MODE}" == "traefik" && -f "${APP_DIR}/docker-compose.override.yml" ]]; then
     (cd "${APP_DIR}" && docker compose up -d --force-recreate app) || true
+  fi
+
+  if [[ "${PROXY_MODE}" == "caddy-docker" ]]; then
+    log "Wiring ${DOMAIN} into Caddy..."
+    if [[ -f "${APP_DIR}/scripts/wire-caddy.sh" ]]; then
+      bash "${APP_DIR}/scripts/wire-caddy.sh" || warn "Auto-wire failed — run: bash ${APP_DIR}/scripts/wire-caddy.sh"
+    else
+      warn "Missing ${APP_DIR}/scripts/wire-caddy.sh — pull latest and re-run it."
+    fi
   fi
 
   health_check

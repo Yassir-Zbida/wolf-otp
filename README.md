@@ -33,6 +33,14 @@ The script installs Docker/nginx/certbot if missing, clones into `/opt/wolf-otp`
 
 Credentials are saved to `/opt/wolf-otp/CREDENTIALS.txt`.
 
+If the VPS already uses **Caddy in Docker** (port 80/443 taken), after deploy run:
+
+```bash
+bash /opt/wolf-otp/scripts/wire-caddy.sh
+```
+
+That joins the OTP container to Caddy’s network and adds `otp.wolfstor.com` with HTTPS.
+
 ## Manual / local start
 
 ```bash
